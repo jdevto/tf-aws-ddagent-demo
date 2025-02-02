@@ -1,0 +1,73 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+
+write_files:
+  - path: /usr/local/bin/setup-instance.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -e
+      exec > /var/log/setup-instance.log 2>&1
+
+      echo "Fetching IMDSv2 token..."
+      TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+      INSTANCE_ID=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+
+      echo "Setting hostname to $${INSTANCE_ID}"
+      hostnamectl set-hostname "$${INSTANCE_ID}"
+      echo "$${INSTANCE_ID}" > /etc/hostname
+      sed -i "s/^127.0.0.1 .*/127.0.0.1 $${INSTANCE_ID} localhost/" /etc/hosts"
+      echo "Hostname setup complete."
+
+runcmd:
+  - echo "Running Cloud-Init setup script..." | tee -a /var/log/cloud-init-output.log
+  - /usr/local/bin/setup-instance.sh
+
+  # Install Datadog Agent Natively on Amazon Linux 2023
+  - echo "Installing Datadog Agent..."
+  - export DD_API_KEY=${dd_api_key}
+  - export DD_SITE="datadoghq.com"
+
+  # Add Datadog’s RPM repository
+  - rpm --import https://keys.datadoghq.com/DATADOG_RPM_KEY_CURRENT.public
+  - sh -c "echo -e '[datadog]\nname=Datadog\nbaseurl=https://yum.datadoghq.com/stable/7/x86_64/\nenabled=1\ngpgcheck=1\ngpgkey=https://keys.datadoghq.com/DATADOG_RPM_KEY_CURRENT.public' > /etc/yum.repos.d/datadog.repo"
+
+  # Install Datadog Agent
+  - dnf install -y datadog-agent
+
+  # Ensure API key is set
+  - |
+    if [ ! -f /etc/datadog-agent/datadog.yaml ]; then
+      echo "Creating /etc/datadog-agent/datadog.yaml..."
+      echo -e "api_key: $DD_API_KEY\n" >> /etc/datadog-agent/datadog.yaml
+    else
+      echo "Ensuring API key is set..."
+      sed -i '/^api_key:/d' /etc/datadog-agent/datadog.yaml
+    fi
+
+  # Ensure network_config_enabled exists and is set to true
+  - |
+    if grep -q "^network_config_enabled:" /etc/datadog-agent/datadog.yaml; then
+        sed -i 's/^network_config_enabled:.*/network_config_enabled: true/' /etc/datadog-agent/datadog.yaml
+    else
+        echo "network_config_enabled: true" >> /etc/datadog-agent/datadog.yaml
+    fi
+
+  # Ensure system-probe.yaml exists and is properly configured
+  - |
+    if [ ! -f /etc/datadog-agent/system-probe.yaml ]; then
+      echo "Creating /etc/datadog-agent/system-probe.yaml..."
+      echo -e "system_probe_config:\n  enabled: true" > /etc/datadog-agent/system-probe.yaml
+    else
+      echo "Ensuring system_probe_config is enabled..."
+      sed -i '/^  enabled:/d' /etc/datadog-agent/system-probe.yaml
+      sed -i 's/^system_probe_config:.*/system_probe_config:\n  enabled: true/' /etc/datadog-agent/system-probe.yaml
+    fi
+
+  # Restart and Enable Datadog Agent
+  - systemctl restart datadog-agent
+  - systemctl enable datadog-agent
+
+  # Verify Datadog Agent Installation
+  - [ "sh", "-c", "systemctl is-active --quiet datadog-agent && echo 'Datadog Agent installed successfully.' || echo 'ERROR: Datadog Agent installation failed.'" ]

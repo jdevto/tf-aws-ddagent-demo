@@ -1,0 +1,132 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+packages:
+  - docker
+
+write_files:
+  - path: /usr/local/bin/setup-instance.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -e
+      exec > /var/log/setup-instance.log 2>&1
+
+      echo "Fetching IMDSv2 token..."
+      TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+      INSTANCE_ID=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+
+      echo "Setting hostname to $${INSTANCE_ID}"
+      hostnamectl set-hostname "$${INSTANCE_ID}"
+      echo "$${INSTANCE_ID}" > /etc/hostname
+      sed -i "s/^127.0.0.1 .*/127.0.0.1 $${INSTANCE_ID} localhost/" /etc/hosts"
+      echo "Hostname setup complete."
+
+  - path: /opt/datadog/docker-compose.yml
+    permissions: "0644"
+    content: |
+      services:
+        datadog-agent:
+          image: gcr.io/datadoghq/agent:7
+          container_name: datadog-agent
+          restart: on-failure:5
+          privileged: true
+          environment:
+            - DD_API_KEY=${dd_api_key}
+            - DD_DOGSTATSD_NON_LOCAL_TRAFFIC=true # enables agent to receive custom metrics from other containers
+            - DD_SITE=datadoghq.com
+            - DD_SYSTEM_PROBE_NETWORK_ENABLED=true
+            - DD_PROCESS_AGENT_ENABLED=true
+            - DD_LOG_LEVEL=info
+          volumes:
+            - /var/run/docker.sock:/var/run/docker.sock:ro
+            - /proc/:/host/proc/:ro
+            - /sys/fs/cgroup/:/host/sys/fs/cgroup:ro
+            - /var/lib/docker/containers:/var/lib/docker/containers:ro
+            - /etc/os-release:/host/etc/os-release:ro
+            - /opt/datadog/datadog.yaml:/etc/datadog-agent/datadog.yaml:ro
+            - /opt/datadog/system-probe.yaml:/etc/datadog-agent/system-probe.yaml:ro
+            - /sys/kernel/debug:/sys/kernel/debug
+          cap_add:
+            - SYS_ADMIN
+            - SYS_RESOURCE
+            - SYS_PTRACE
+            - NET_ADMIN
+            - NET_BROADCAST
+            - NET_RAW
+            - IPC_LOCK
+            - CHOWN
+          security_opt:
+            - apparmor:unconfined
+      networks:
+        monitoring:
+          driver: bridge
+
+  - path: /opt/datadog/system-probe.yaml
+    permissions: "0644"
+    content: |
+      system_probe_config:
+        enabled: true
+        log_level: info
+        bpf_debug: false
+        enable_conntrack: true
+        enable_tcp_queue_length: true
+        enable_oom_kill: true
+        enable_runtime_compiler: false
+        collect_dns_stats: true
+
+  - path: /opt/datadog/datadog.yaml
+    permissions: "0644"
+    content: |
+      network_config_enabled: true
+      process_config:
+        enabled: true
+
+  - path: /opt/webserver/docker-compose.yml
+    permissions: "0644"
+    content: |
+      services:
+        web:
+          image: nginx:latest
+          container_name: time-webserver
+          restart: unless-stopped
+          ports:
+            - "8080:80"
+          volumes:
+            - ./html:/usr/share/nginx/html:ro
+          networks:
+            - monitoring
+        updater:
+          image: alpine
+          container_name: time-updater
+          restart: unless-stopped
+          volumes:
+            - ./html:/html
+          command: ["sh", "-c", "while true; do date > /html/index.html; sleep 60; done"]
+          networks:
+            - monitoring
+      networks:
+        monitoring:
+          external: true
+
+runcmd:
+  - echo "Running Cloud-Init setup script..." | tee -a /var/log/cloud-init-output.log
+  - /usr/local/bin/setup-instance.sh
+
+  # Enable and start Docker
+  - systemctl enable --now docker
+
+  # Install Docker Compose v2
+  - mkdir -p /usr/local/lib/docker/cli-plugins
+  - curl -SL https://github.com/docker/compose/releases/download/v2.32.4/docker-compose-linux-x86_64 -o /usr/local/lib/docker/cli-plugins/docker-compose
+  - chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+  - ln -sf /usr/local/lib/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose
+
+  # Create docker network
+  - docker network create monitoring || true
+
+  # Start Webserver using Docker Compose
+  - /usr/local/bin/docker-compose -f /opt/webserver/docker-compose.yml up -d && echo "Webserver started."
+
+  # Start Datadog Agent using Docker Compose
+  - /usr/local/bin/docker-compose -f /opt/datadog/docker-compose.yml up -d && echo "Datadog Agent started."
